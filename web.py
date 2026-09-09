@@ -43,6 +43,9 @@ MIME_TYPES = {
 
 app = Flask(__name__, static_folder=None)
 
+# So the page can tell a stale python process (old routes, new HTML) from a current one.
+SERVER_FEATURES = ["cut", "join", "transcribe", "srt", "import-subs", "export-subs"]
+
 # Running jobs, keyed by id. A cut can take minutes, so it runs in a thread and the
 # page polls for the log.
 JOBS = {}
@@ -75,6 +78,12 @@ def index():
     return send_from_directory(HERE / "webui", "index.html")
 
 
+@app.route("/api/health")
+def api_health():
+    """Tiny handshake so the page can tell this process has the latest routes."""
+    return jsonify({"ok": True, "app": "video_cutter", "features": SERVER_FEATURES})
+
+
 @app.route("/api/list")
 def api_list():
     """List the sub-folders and videos of one directory."""
@@ -98,12 +107,14 @@ def api_list():
                 if not entry.name.startswith("."):
                     dirs.append({"name": entry.name, "path": str(entry)})
             elif entry.suffix.lower() in VIDEO_SUFFIXES:
+                sidecar = vc.find_sidecar_srt(entry)
                 files.append({
                     "name": entry.name,
                     "path": str(entry),
                     "size": entry.stat().st_size,
                     "duration": video_duration(entry),
                     "playable": entry.suffix.lower() in {".mp4", ".m4v", ".webm", ".mov"},
+                    "srt": str(sidecar) if sidecar else None,
                 })
         except OSError:
             continue
@@ -197,7 +208,8 @@ def api_transcribe():
     groq_api_key = (payload.get("groq_api_key") or "").strip() or None
 
     job_id = uuid.uuid4().hex[:12]
-    job = {"id": job_id, "status": "running", "log": "", "segments": [], "error": None}
+    job = {"id": job_id, "status": "running", "log": "", "segments": [],
+           "srt": None, "error": None}
     with JOBS_LOCK:
         JOBS[job_id] = job
 
@@ -225,7 +237,15 @@ def run_transcribe_job(job, source, engine, model_size, language, groq_api_key):
             else:
                 vc.transcribe_audio(source, model_size=model_size, language=language,
                                     progress=on_segment)
+            with JOBS_LOCK:
+                segments = list(job["segments"])
+            srt_path = None
+            if segments:
+                srt_path = Path(source).with_suffix(".srt")
+                vc.write_srt(segments, srt_path)
+                print(f"  wrote {srt_path}")
         with JOBS_LOCK:
+            job["srt"] = str(srt_path) if srt_path else None
             job["status"] = "done"
     except Exception as ex:
         with JOBS_LOCK:
@@ -272,6 +292,148 @@ def run_join_job(job, kwargs):
         with JOBS_LOCK:
             job["error"] = str(ex)
             job["status"] = "error"
+
+
+@app.route("/api/srt", methods=["GET", "POST"])
+def api_srt():
+    """Load or save the sidecar .srt next to a video (never burned into the picture)."""
+    if request.method == "GET":
+        raw = (request.args.get("video") or "").strip()
+        if not raw:
+            return jsonify({"error": "no video path"}), 400
+        srt = vc.find_sidecar_srt(Path(raw).expanduser())
+        if not srt:
+            return jsonify({"segments": [], "srt": None})
+        try:
+            segments = vc.read_srt(srt)
+        except (ValueError, OSError) as ex:
+            return jsonify({"error": str(ex)}), 400
+        return jsonify({"segments": segments, "srt": str(srt.resolve())})
+
+    payload = request.json or {}
+    raw = (payload.get("video") or payload.get("srt") or "").strip()
+    if not raw:
+        return jsonify({"error": "no video path"}), 400
+    segments = payload.get("segments")
+    if not isinstance(segments, list):
+        return jsonify({"error": "segments must be a list"}), 400
+    target = Path(raw).expanduser()
+    if target.suffix.lower() != ".srt":
+        target = target.with_suffix(".srt")
+    try:
+        vc.write_srt(segments, target)
+    except (OSError, ValueError) as ex:
+        return jsonify({"error": str(ex)}), 400
+    return jsonify({"srt": str(target.resolve())})
+
+
+@app.route("/api/import-subs", methods=["POST"])
+def api_import_subs():
+    """Pull captions already on a video (embedded text track, else sidecar .srt)."""
+    payload = request.json or {}
+    source = (payload.get("video") or payload.get("input") or "").strip()
+    if not source:
+        return jsonify({"error": "no video path"}), 400
+    path = Path(source).expanduser()
+    if not path.is_file():
+        return jsonify({"error": f"no such file: {path}"}), 404
+    stream = payload.get("stream")
+    try:
+        stream = int(stream) if stream is not None and stream != "" else None
+    except (TypeError, ValueError):
+        return jsonify({"error": "stream must be a number"}), 400
+    try:
+        segments, srt = vc.import_subtitles(path, stream=stream)
+    except RuntimeError as ex:
+        return jsonify({"error": str(ex)}), 400
+    return jsonify({"segments": segments, "srt": str(Path(srt).resolve())})
+
+
+@app.route("/api/export-subs", methods=["POST"])
+def api_export_subs():
+    """Mux the edited captions into a new video as a toggleable subtitle track."""
+    payload = request.json or {}
+    source = (payload.get("video") or payload.get("input") or "").strip()
+    if not source:
+        return jsonify({"error": "no video path"}), 400
+
+    segments = payload.get("segments") or []
+    if not isinstance(segments, list) or not any(
+            (seg.get("text") or "").strip() for seg in segments if isinstance(seg, dict)):
+        return jsonify({"error": "no captions to export - transcribe or edit first"}), 400
+
+    src = Path(source)
+    output = (payload.get("output") or "").strip()
+    if not output:
+        output = str(src.with_name(f"{src.stem}_subs{src.suffix or '.mp4'}"))
+    style = payload.get("style") if isinstance(payload.get("style"), dict) else {}
+
+    job_id = uuid.uuid4().hex[:12]
+    job = {"id": job_id, "status": "running", "log": "", "output": None, "error": None}
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+
+    thread = threading.Thread(
+        target=run_export_subs_job,
+        args=(job, source, segments, output, style),
+        daemon=True,
+    )
+    thread.start()
+    return jsonify({"job": job_id})
+
+
+def run_export_subs_job(job, source, segments, output, style=None):
+    writer = LogWriter(job)
+    try:
+        with redirect_stdout(writer):
+            source_path = Path(source)
+            target = Path(output)
+            srt = source_path.with_suffix(".srt")
+            vc.write_srt(segments, srt)
+            print(f"  wrote {srt}")
+            # Browsers and the Windows player ignore MP4 subtitle tracks, so the
+            # words have to be drawn onto the picture or they look "missing".
+            result = vc.burn_captions(source_path, segments, target, style=style or {})
+            sidecar = Path(result).with_suffix(".srt")
+            if sidecar.resolve() != srt.resolve():
+                vc.write_srt(segments, sidecar)
+                print(f"  wrote {sidecar}")
+        with JOBS_LOCK:
+            job["output"] = str(result)
+            job["status"] = "done"
+    except Exception as ex:
+        with JOBS_LOCK:
+            job["error"] = str(ex)
+            job["status"] = "error"
+
+
+@app.errorhandler(404)
+def not_found(_err):
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "error": (
+                f"unknown endpoint {request.method} {request.path}. "
+                "The page is newer than this python process. In Task Manager end every "
+                "python.exe, then in the video_cutter folder run: python web.py"
+            ),
+        }), 404
+    return "not found", 404
+
+
+@app.errorhandler(405)
+def method_not_allowed(_err):
+    if request.path.startswith("/api/"):
+        return jsonify({
+            "error": f"{request.method} not allowed on {request.path}",
+        }), 405
+    return "method not allowed", 405
+
+
+@app.errorhandler(500)
+def server_error(err):
+    if request.path.startswith("/api/"):
+        return jsonify({"error": str(err) or "internal server error"}), 500
+    return "internal server error", 500
 
 
 @app.route("/api/job/<job_id>")
@@ -323,7 +485,10 @@ def main():
     url = f"http://{args.host}:{args.port}/?dir={start_dir}"
     print(f"video_cutter web UI -> http://{args.host}:{args.port}")
     print(f"  starting folder: {start_dir}")
+    print(f"  features: {', '.join(SERVER_FEATURES)}")
     print("  press Ctrl+C to stop")
+    print("  if export fails with HTML/JSON errors, this window is not the one serving")
+    print("  the browser — close other python.exe processes and start this again")
     if not args.no_browser:
         # The browser is on this machine, so opening it here actually works.
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()

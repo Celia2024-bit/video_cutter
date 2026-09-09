@@ -133,13 +133,13 @@ def require_tools():
         )
 
 
-def run_ffmpeg(args, verbose=False):
+def run_ffmpeg(args, verbose=False, cwd=None):
     """Run ffmpeg, showing its output only when it matters."""
     cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-y"]
     cmd += ["-loglevel", "info" if verbose else "error"]
     cmd += args
     res = subprocess.run(cmd, capture_output=not verbose, text=True,
-                         encoding="utf-8", errors="replace")
+                         encoding="utf-8", errors="replace", cwd=cwd)
     if res.returncode != 0:
         detail = (res.stderr or res.stdout or "").strip() if not verbose else ""
         raise RuntimeError(f"ffmpeg failed (exit {res.returncode})\n{detail}")
@@ -364,10 +364,388 @@ def write_srt(segments, target):
     Path(target).write_text("\n".join(lines), encoding="utf-8")
 
 
+def parse_srt_time(text):
+    """Parse 00:00:01,234 (or with a dot) into seconds."""
+    raw = str(text).strip().replace(".", ",")
+    if "," not in raw:
+        raw += ",000"
+    hms, frac = raw.split(",", 1)
+    parts = hms.split(":")
+    if len(parts) != 3:
+        raise ValueError(f"'{text}' is not an SRT timestamp")
+    try:
+        hours, minutes, secs = (int(p) for p in parts)
+        millis = int(frac.ljust(3, "0")[:3])
+    except ValueError as ex:
+        raise ValueError(f"'{text}' is not an SRT timestamp") from ex
+    return hours * 3600 + minutes * 60 + secs + millis / 1000.0
+
+
+def read_srt_bytes(path):
+    """Decode an .srt trying encodings common on Windows Chinese systems."""
+    data = Path(path).read_bytes()
+    if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return data.decode("gb18030")
+
+
+def read_srt(path):
+    """Read an .srt file into a list of {start, end, text} segments."""
+    raw = read_srt_bytes(path).replace("\r\n", "\n").replace("\r", "\n")
+    raw = raw.strip()
+    if not raw:
+        return []
+    segments = []
+    for block in raw.split("\n\n"):
+        lines = block.split("\n")
+        while lines and not lines[-1].strip():
+            lines.pop()
+        if not lines:
+            continue
+        if lines[0].strip().isdigit():
+            lines = lines[1:]
+        if not lines or "-->" not in lines[0]:
+            continue
+        left, right = lines[0].split("-->", 1)
+        text = "\n".join(lines[1:]).strip()
+        if not text:
+            continue
+        segments.append({
+            "start": parse_srt_time(left),
+            "end": parse_srt_time(right),
+            "text": text,
+        })
+    return segments
+
+
+def find_sidecar_srt(video):
+    """Sidecar next to a video: stem.srt, or stem.zh.srt / stem.en.srt, any case."""
+    video = Path(video)
+    parent = video.parent
+    stem = video.stem
+    exact = video.with_suffix(".srt")
+    if exact.is_file():
+        return exact
+    if not parent.is_dir():
+        return None
+    stem_l = stem.lower()
+    tagged = []
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return None
+    for entry in entries:
+        try:
+            if not entry.is_file() or entry.suffix.lower() != ".srt":
+                continue
+        except OSError:
+            continue
+        name = entry.stem.lower()
+        if name == stem_l:
+            return entry
+        if name.startswith(stem_l + "."):
+            tagged.append(entry)
+    tagged.sort(key=lambda p: p.name.lower())
+    return tagged[0] if tagged else None
+
+
+TEXT_SUBTITLE_CODECS = {
+    "subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text", "ttml",
+    "microdvd", "mpl2", "sami", "realtext", "subviewer",
+}
+
+
+def list_subtitle_streams(path):
+    """List subtitle tracks. `stream` is the 0-based index for -map 0:s:N."""
+    path = Path(path)
+    if not path.is_file():
+        raise RuntimeError(f"no such file: {path}")
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "s",
+         "-show_entries", "stream=index,codec_name,codec_type",
+         "-show_entries", "stream_tags=language,title",
+         "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    if res.returncode != 0:
+        raise RuntimeError(f"ffprobe could not read {path}:\n{res.stderr.strip()}")
+    try:
+        raw_streams = json.loads(res.stdout or "{}").get("streams", [])
+    except json.JSONDecodeError:
+        raw_streams = []
+    streams = []
+    for i, stream in enumerate(raw_streams):
+        codec = (stream.get("codec_name") or "").lower()
+        tags = stream.get("tags") or {}
+        streams.append({
+            "index": stream.get("index"),
+            "stream": i,
+            "codec": codec,
+            "text": codec in TEXT_SUBTITLE_CODECS,
+            "language": tags.get("language"),
+            "title": tags.get("title"),
+        })
+    return streams
+
+
+def extract_subtitles(source, target, stream=0, verbose=False):
+    """Extract one text subtitle track into an .srt file."""
+    source = Path(source)
+    streams = list_subtitle_streams(source)
+    if not streams:
+        raise RuntimeError(f"{source.name}: no subtitle track to import")
+    if stream < 0 or stream >= len(streams):
+        raise RuntimeError(f"{source.name}: subtitle stream {stream} is out of range")
+    chosen = streams[stream]
+    if not chosen["text"]:
+        raise RuntimeError(
+            f"{source.name}: subtitle track {stream} is {chosen['codec'] or 'bitmap'} "
+            "— only text tracks can be imported"
+        )
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    run_ffmpeg(
+        ["-i", str(source), "-map", f"0:s:{stream}", "-c:s", "srt", str(target)],
+        verbose,
+    )
+    return target
+
+
+def import_subtitles(source, target=None, stream=None):
+    """Import captions already on a video: embedded text track, else sidecar .srt.
+
+    Writes (or reuses) a sidecar .srt next to the video. Returns (segments, srt_path).
+    """
+    source = Path(source)
+    if not source.is_file():
+        raise RuntimeError(f"no such file: {source}")
+    target = Path(target) if target else source.with_suffix(".srt")
+    text_streams = [s for s in list_subtitle_streams(source) if s["text"]]
+    if text_streams:
+        index = stream if stream is not None else text_streams[0]["stream"]
+        extract_subtitles(source, target, stream=index)
+        return read_srt(target), target
+    sidecar = source.with_suffix(".srt")
+    if sidecar.is_file():
+        return read_srt(sidecar), sidecar
+    raise RuntimeError(
+        f"{source.name}: no subtitle track and no .srt beside it"
+    )
+
+
+def mux_subtitles(source, srt, output, verbose=False):
+    """Copy the video and attach a subtitle track the player can show or hide.
+
+    Does not burn text into pixels. MP4/MOV get mov_text; MKV keeps text subs.
+    """
+    source = Path(source)
+    srt = Path(srt)
+    output = Path(output)
+    if not source.is_file():
+        raise RuntimeError(f"no such file: {source}")
+    if not srt.is_file():
+        raise RuntimeError(f"no subtitle file: {srt}")
+    if output.resolve() == source.resolve():
+        raise RuntimeError("the output would overwrite the input - pick another name")
+
+    suffix = (output.suffix or "").lower()
+    if suffix in {".mp4", ".m4v", ".mov"}:
+        sub_codec = "mov_text"
+    elif suffix == ".mkv":
+        sub_codec = "srt"
+    else:
+        print(f"  note: {suffix or 'this container'} cannot hold a subtitle track, "
+              "writing .mp4 instead")
+        output = output.with_suffix(".mp4")
+        sub_codec = "mov_text"
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    print(f"\n{source.name}  exporting with captions -> {output.name}")
+    run_ffmpeg(
+        ["-i", str(source), "-i", str(srt),
+         "-map", "0:v:0", "-map", "0:a?", "-map", "1:0",
+         "-c:v", "copy", "-c:a", "copy", "-c:s", sub_codec,
+         "-disposition:s:0", "default", str(output)],
+        verbose,
+    )
+    print(f"  wrote {output}  ({output.stat().st_size / 1_048_576:.1f} MB)")
+    return output
+
+
 def write_txt(segments, target):
     """Write segments out as a plain timestamped transcript."""
     lines = [f"[{format_time(seg['start'])}] {seg['text']}" for seg in segments]
     Path(target).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# Numpad-style ASS alignment: 2 bottom-centre, 5 middle, 8 top-centre.
+ASS_ALIGN = {"bottom": 2, "middle": 5, "top": 8}
+
+DEFAULT_CAPTION_STYLE = {
+    "position": "bottom",
+    "font": "Microsoft YaHei",
+    "fontsize": 48,
+    "color": "#FFFFFF",
+    "outline_color": "#000000",
+    "outline": 2,
+    "margin_v": 40,
+    "margin_lr": 20,
+}
+
+
+def css_color_to_ass(color):
+    """Turn #RRGGBB (or #RGB) into ASS &HAABBGGRR. Alpha 00 is opaque."""
+    raw = str(color).strip().lstrip("#")
+    if len(raw) == 3:
+        raw = "".join(ch * 2 for ch in raw)
+    if len(raw) != 6:
+        raise ValueError(f"'{color}' is not a #RRGGBB colour")
+    r, g, b = raw[0:2], raw[2:4], raw[4:6]
+    return f"&H00{b}{g}{r}".upper()
+
+
+def ass_time(seconds):
+    """Format seconds as H:MM:SS.cc, the ASS clock (centiseconds)."""
+    cs = int(round(max(0.0, seconds) * 100))
+    hours, cs = divmod(cs, 360_000)
+    minutes, cs = divmod(cs, 6_000)
+    secs, cs = divmod(cs, 100)
+    return f"{hours}:{minutes:02d}:{secs:02d}.{cs:02d}"
+
+
+def escape_ass_text(text):
+    """Keep libass from treating { } as override blocks."""
+    return (
+        str(text)
+        .replace("\\", r"\\")
+        .replace("{", r"\{")
+        .replace("}", r"\}")
+        .replace("\r\n", r"\N")
+        .replace("\n", r"\N")
+    )
+
+
+def write_ass(segments, target, style=None):
+    """Write segments out as a styled .ass subtitle file."""
+    merged = dict(DEFAULT_CAPTION_STYLE)
+    if style:
+        merged.update({k: v for k, v in style.items() if v is not None and v != ""})
+
+    position = str(merged.get("position") or "bottom").lower()
+    if position not in ASS_ALIGN:
+        raise ValueError(f"position must be top, middle or bottom, not '{position}'")
+    try:
+        fontsize = int(merged["fontsize"])
+        outline = int(merged["outline"])
+        margin_v = int(merged["margin_v"])
+        margin_lr = int(merged.get("margin_lr", 20))
+    except (TypeError, ValueError) as ex:
+        raise ValueError(f"caption style has a non-numeric size: {ex}") from ex
+
+    primary = css_color_to_ass(merged["color"])
+    outline_colour = css_color_to_ass(merged["outline_color"])
+    font = str(merged["font"]).replace(",", " ")
+    align = ASS_ALIGN[position]
+
+    # PlayRes 1920x1080 so Fontsize/MarginV behave like pixels on 1080p;
+    # ffmpeg's subtitles filter then scales the script to the real video.
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1920\n"
+        "PlayResY: 1080\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n"
+        "\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, "
+        "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, "
+        "ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Default,{font},{fontsize},{primary},&H000000FF,"
+        f"{outline_colour},&H00000000,0,0,0,0,100,100,0,0,1,{outline},0,"
+        f"{align},{margin_lr},{margin_lr},{margin_v},1\n"
+        "\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+        "Effect, Text\n"
+    )
+    lines = [header.rstrip("\n")]
+    for seg in segments:
+        text = escape_ass_text((seg.get("text") or "").strip())
+        if not text:
+            continue
+        start = ass_time(float(seg["start"]))
+        end = ass_time(float(seg["end"]))
+        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
+    Path(target).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def escape_ffmpeg_filter_path(path):
+    """Escape a filesystem path for an ffmpeg filtergraph option."""
+    text = Path(path).resolve().as_posix()
+    return (text.replace("\\", "/")
+                .replace(":", r"\:")
+                .replace("'", r"\'")
+                .replace("[", r"\[")
+                .replace("]", r"\]")
+                .replace(",", r"\,")
+                .replace(";", r"\;"))
+
+
+def default_fonts_dir():
+    """Folder ffmpeg/libass can scan for the fonts named in the .ass file."""
+    if sys.platform == "win32":
+        candidate = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
+        if candidate.is_dir():
+            return candidate
+    for candidate in (Path("/usr/share/fonts"), Path("/usr/local/share/fonts"),
+                      Path("/Library/Fonts")):
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
+def burn_captions(source, segments, output, style=None, crf=20, preset="veryfast",
+                  verbose=False):
+    """Burn styled captions into a copy of the video. Returns the output path."""
+    source = Path(source)
+    if not source.is_file():
+        raise RuntimeError(f"no such file: {source}")
+    usable = [seg for seg in segments if (seg.get("text") or "").strip()]
+    if not usable:
+        raise RuntimeError("no captions to burn - transcribe and edit first")
+
+    target = Path(output)
+    if target.resolve() == source.resolve():
+        raise RuntimeError("the output would overwrite the input - pick another name")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"\n{source.name}  burning {len(usable)} caption(s) -> {target.name}")
+    workdir = Path(tempfile.mkdtemp(prefix="video_cutter_cap_"))
+    try:
+        ass_path = workdir / "captions.ass"
+        write_ass(usable, ass_path, style=style)
+        # Relative name so the filtergraph never sees a Windows drive colon.
+        vf = "subtitles=captions.ass"
+        fonts = default_fonts_dir()
+        if fonts:
+            vf += f":fontsdir='{escape_ffmpeg_filter_path(fonts)}'"
+        run_ffmpeg(
+            ["-i", str(source), "-map", "0:v:0", "-map", "0:a?",
+             "-vf", vf, "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+             "-pix_fmt", "yuv420p", "-c:a", "copy", str(target)],
+            verbose,
+            cwd=str(workdir),
+        )
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    print(f"  wrote {target}  ({target.stat().st_size / 1_048_576:.1f} MB)")
+    return target
 
 
 # ---------------------------------------------------------------------- the work
