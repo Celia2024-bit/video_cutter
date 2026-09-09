@@ -14,11 +14,19 @@ Batch several videos with --config edits.json (see README.md for the schema).
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+
+# faster-whisper downloads its model from Hugging Face through "Xet", a newer,
+# faster transfer backend. On some networks (proxies, firewalls, flaky links) Xet's
+# CAS servers are unreachable and the download fails with a CAS/reqwest error after
+# a few retries. Falling back to the plain HTTP downloader avoids that; it only has
+# to be set before huggingface_hub is imported, which happens inside transcribe_audio().
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 # Containers that can hold the H.264 + AAC streams produced by --mode reencode.
 # Anything else (.webm, .avi, ...) is written as .mp4 instead.
@@ -137,6 +145,31 @@ def run_ffmpeg(args, verbose=False):
         raise RuntimeError(f"ffmpeg failed (exit {res.returncode})\n{detail}")
 
 
+def require_asr():
+    """Fail early and clearly when the speech-recognition package is missing."""
+    try:
+        import faster_whisper  # noqa: F401
+    except ImportError as ex:
+        raise RuntimeError(
+            "faster-whisper is not installed. Run: pip install faster-whisper"
+        ) from ex
+
+
+def require_groq(api_key):
+    """Fail early and clearly when the groq package or API key is missing."""
+    try:
+        import groq  # noqa: F401
+    except ImportError as ex:
+        raise RuntimeError(
+            "the groq package is not installed. Run: pip install groq"
+        ) from ex
+    if not api_key:
+        raise RuntimeError(
+            "no Groq API key. Set the GROQ_API_KEY environment variable, or pass "
+            "one in, from a free key at https://console.groq.com/keys"
+        )
+
+
 def probe_duration(path):
     """Read the duration of a video in seconds."""
     res = subprocess.run(
@@ -175,6 +208,166 @@ def print_info(path):
         if rate and rate not in ("0/0",):
             bits.append(f"{rate} fps")
         print(f"  stream {stream.get('index', '?')} : " + "  ".join(bits))
+
+
+# --------------------------------------------------------------- speech to text
+
+def extract_audio(source, target, verbose=False):
+    """Pull out mono 16kHz audio, the format the recognizer expects."""
+    run_ffmpeg(["-i", str(source), "-vn", "-ac", "1", "-ar", "16000", "-f", "wav",
+                str(target)], verbose)
+
+
+def transcribe_audio(source, model_size="small", language=None, verbose=False,
+                      progress=None):
+    """Transcribe the speech in a video/audio file.
+
+    Runs fully offline once the chosen model has been downloaded the first time
+    (faster-whisper fetches it from Hugging Face on first use, then caches it).
+    Returns a list of {"start", "end", "text"} segments, in order.
+
+    `progress`, if given, is called as progress(start, end, text) for every
+    segment as soon as it is recognized, so a caller can show live results
+    instead of waiting for the whole file.
+    """
+    require_asr()
+    from faster_whisper import WhisperModel
+
+    source = Path(source)
+    if not source.is_file():
+        raise RuntimeError(f"no such file: {source}")
+
+    workdir = Path(tempfile.mkdtemp(prefix="video_cutter_asr_"))
+    try:
+        wav = workdir / "audio.wav"
+        print("  extracting audio ...")
+        extract_audio(source, wav, verbose)
+
+        print(f"  loading model '{model_size}' (first run downloads it) ...")
+        model = WhisperModel(model_size, device="cpu", compute_type="int8")
+
+        print("  transcribing ...")
+        segment_iter, info = model.transcribe(str(wav), language=language,
+                                              vad_filter=True)
+        detected = getattr(info, "language", None)
+        if detected and not language:
+            print(f"  detected language: {detected}")
+
+        segments = []
+        for seg in segment_iter:
+            text = seg.text.strip()
+            if not text:
+                continue
+            segments.append({"start": seg.start, "end": seg.end, "text": text})
+            if progress:
+                progress(seg.start, seg.end, text)
+            else:
+                print(f"  [{format_time(seg.start)} -> {format_time(seg.end)}] {text}")
+        return segments
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+# Groq's API caps each request at 25MB, so long audio is sent in chunks; 15 minutes
+# of mono 64kbps mp3 is a little over 7MB, comfortably inside that limit.
+GROQ_CHUNK_SECONDS = 15 * 60
+
+
+def extract_audio_chunk(source, start, duration, target, verbose=False):
+    """Extract one small, compressed slice of audio for a single Groq request."""
+    args = ["-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(source),
+            "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k",
+            str(target)]
+    run_ffmpeg(args, verbose)
+
+
+def transcribe_audio_groq(source, language=None, api_key=None, verbose=False,
+                          progress=None, chunk_seconds=GROQ_CHUNK_SECONDS):
+    """Transcribe speech using Groq's hosted Whisper API instead of a local model.
+
+    No model download, so this is the easy way out on networks that block
+    Hugging Face but allow api.groq.com. Needs `pip install groq` and an API key
+    from https://console.groq.com/keys (env var GROQ_API_KEY, or pass api_key=).
+    Audio is split into a few-minute chunks to stay under Groq's per-request size
+    limit; the chunk timestamps are offset back onto the full timeline.
+    Returns a list of {"start", "end", "text"} segments, in order.
+    """
+    api_key = api_key or os.environ.get("GROQ_API_KEY")
+    require_groq(api_key)
+    from groq import Groq
+
+    source = Path(source)
+    if not source.is_file():
+        raise RuntimeError(f"no such file: {source}")
+
+    duration = probe_duration(source)
+    client = Groq(api_key=api_key)
+
+    workdir = Path(tempfile.mkdtemp(prefix="video_cutter_groq_"))
+    segments = []
+    try:
+        offset = 0.0
+        chunk_index = 0
+        while offset < duration:
+            chunk_index += 1
+            length = min(chunk_seconds, duration - offset)
+            chunk_path = workdir / f"chunk{chunk_index:03d}.mp3"
+            print(f"  chunk {chunk_index}: extracting {format_time(offset)}"
+                  f" + {length:.0f}s ...")
+            extract_audio_chunk(source, offset, length, chunk_path, verbose)
+
+            print(f"  chunk {chunk_index}: sending to Groq ...")
+            with open(chunk_path, "rb") as fh:
+                result = client.audio.transcriptions.create(
+                    file=(chunk_path.name, fh.read()),
+                    model="whisper-large-v3",
+                    language=language,
+                    response_format="verbose_json",
+                )
+            chunk_path.unlink(missing_ok=True)
+
+            for seg in getattr(result, "segments", None) or []:
+                get = seg.get if isinstance(seg, dict) else (
+                    lambda k, s=seg: getattr(s, k, None))
+                text = (get("text") or "").strip()
+                if not text:
+                    continue
+                start = offset + get("start")
+                end = offset + get("end")
+                segments.append({"start": start, "end": end, "text": text})
+                if progress:
+                    progress(start, end, text)
+                else:
+                    print(f"  [{format_time(start)} -> {format_time(end)}] {text}")
+
+            offset += length
+        return segments
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def write_srt(segments, target):
+    """Write segments out as an .srt subtitle file."""
+    def srt_time(t):
+        ms = int(round(t * 1000))
+        h, ms = divmod(ms, 3_600_000)
+        m, ms = divmod(ms, 60_000)
+        s, ms = divmod(ms, 1000)
+        return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+    lines = []
+    for i, seg in enumerate(segments, 1):
+        lines.append(str(i))
+        lines.append(f"{srt_time(seg['start'])} --> {srt_time(seg['end'])}")
+        lines.append(seg["text"])
+        lines.append("")
+    Path(target).write_text("\n".join(lines), encoding="utf-8")
+
+
+def write_txt(segments, target):
+    """Write segments out as a plain timestamped transcript."""
+    lines = [f"[{format_time(seg['start'])}] {seg['text']}" for seg in segments]
+    Path(target).write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------- the work
@@ -328,6 +521,8 @@ def main():
   video_cutter.py talk.mp4 --keep 0:00-1:00 --keep 2:00-3:00 --separate
   video_cutter.py --config edits.json
   video_cutter.py talk.mp4 --info                           # duration and streams
+  video_cutter.py talk.mp4 --transcribe                     # speech to text, printed
+  video_cutter.py talk.mp4 --transcribe -o talk.srt          # ... written as subtitles
 """)
     parser.add_argument("input", nargs="?", help="the video to cut")
     parser.add_argument("--cut", action="append", default=[], metavar="START-END",
@@ -347,6 +542,17 @@ def main():
     parser.add_argument("--config", help="JSON edit list for several videos")
     parser.add_argument("--info", action="store_true",
                         help="just print duration and streams, cut nothing")
+    parser.add_argument("--transcribe", action="store_true",
+                        help="speech-to-text the input's audio, cut nothing")
+    parser.add_argument("--engine", choices=["local", "groq"], default="local",
+                        help="local: faster-whisper, offline after first download. "
+                             "groq: Groq's cloud Whisper API, needs GROQ_API_KEY "
+                             "(default local)")
+    parser.add_argument("--asr-model", default="small",
+                        help="faster-whisper model size: tiny/base/small/medium/large-v3 "
+                             "(default small, --engine local only)")
+    parser.add_argument("--groq-api-key", help="overrides the GROQ_API_KEY env var")
+    parser.add_argument("--language", help="speech language code, e.g. en, zh (default: auto-detect)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would be cut and kept, write nothing")
     parser.add_argument("--verbose", action="store_true", help="show ffmpeg output")
@@ -359,6 +565,26 @@ def main():
             if not args.input:
                 parser.error("--info needs an input file")
             print_info(Path(args.input))
+            return 0
+
+        if args.transcribe:
+            if not args.input:
+                parser.error("--transcribe needs an input file")
+            source = Path(args.input)
+            if args.engine == "groq":
+                segments = transcribe_audio_groq(source, language=args.language,
+                                                 api_key=args.groq_api_key,
+                                                 verbose=args.verbose)
+            else:
+                segments = transcribe_audio(source, model_size=args.asr_model,
+                                            language=args.language, verbose=args.verbose)
+            if args.output:
+                target = Path(args.output)
+                if target.suffix.lower() == ".srt":
+                    write_srt(segments, target)
+                else:
+                    write_txt(segments, target)
+                print(f"  wrote {target}")
             return 0
 
         if args.config:

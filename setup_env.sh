@@ -29,6 +29,7 @@ brew install ffmpeg
 # Install flask
 echo "Install flask by pip3"
 pip3 install flask
+pip install faster-whisper
 
 echo ""
 echo "===== ALL DONE ====="

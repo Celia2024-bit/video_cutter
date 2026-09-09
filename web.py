@@ -181,6 +181,58 @@ def run_job(job, kwargs):
             job["status"] = "error"
 
 
+@app.route("/api/transcribe", methods=["POST"])
+def api_transcribe():
+    """Start a speech-to-text job in the background and hand back a job id to poll."""
+    payload = request.json or {}
+    source = (payload.get("input") or "").strip()
+    if not source:
+        return jsonify({"error": "no input file"}), 400
+
+    engine = payload.get("engine") or "local"
+    if engine not in ("local", "groq"):
+        return jsonify({"error": "engine must be 'local' or 'groq'"}), 400
+    model_size = (payload.get("model") or "small").strip()
+    language = (payload.get("language") or "").strip() or None
+    groq_api_key = (payload.get("groq_api_key") or "").strip() or None
+
+    job_id = uuid.uuid4().hex[:12]
+    job = {"id": job_id, "status": "running", "log": "", "segments": [], "error": None}
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+
+    thread = threading.Thread(
+        target=run_transcribe_job,
+        args=(job, source, engine, model_size, language, groq_api_key),
+        daemon=True,
+    )
+    thread.start()
+    return jsonify({"job": job_id})
+
+
+def run_transcribe_job(job, source, engine, model_size, language, groq_api_key):
+    writer = LogWriter(job)
+
+    def on_segment(start, end, text):
+        with JOBS_LOCK:
+            job["segments"].append({"start": start, "end": end, "text": text})
+
+    try:
+        with redirect_stdout(writer):
+            if engine == "groq":
+                vc.transcribe_audio_groq(source, language=language, api_key=groq_api_key,
+                                         progress=on_segment)
+            else:
+                vc.transcribe_audio(source, model_size=model_size, language=language,
+                                    progress=on_segment)
+        with JOBS_LOCK:
+            job["status"] = "done"
+    except Exception as ex:
+        with JOBS_LOCK:
+            job["error"] = str(ex)
+            job["status"] = "error"
+
+
 @app.route("/api/job/<job_id>")
 def api_job(job_id):
     with JOBS_LOCK:

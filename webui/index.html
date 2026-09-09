@@ -104,6 +104,19 @@
   .result.bad { border-color: var(--cut); }
   .result .path { font: 12px ui-monospace, Consolas, monospace; word-break: break-all; }
   .note { margin-top: 8px; color: var(--warn); font-size: 12px; }
+
+  .transcript { margin-top: 8px; max-height: 260px; overflow-y: auto; }
+  .transcript .seg {
+    display: flex; gap: 8px; align-items: flex-start; padding: 5px 4px;
+    border-bottom: 1px solid #23304a;
+  }
+  .transcript .seg:hover { background: #1c2841; }
+  .transcript .t {
+    flex: 0 0 auto; font: 11px ui-monospace, Consolas, monospace; color: var(--accent);
+    padding-top: 2px; cursor: pointer; user-select: none;
+  }
+  .transcript .txt { flex: 1; cursor: pointer; }
+  .transcript .seg .icon { padding: 1px 6px; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -174,6 +187,40 @@
       </fieldset>
 
       <fieldset>
+        <legend>Speech to text</legend>
+        <div class="opts">
+          <label>engine
+            <select id="asr-engine">
+              <option value="local">Local (faster-whisper, offline)</option>
+              <option value="groq">Groq cloud (needs internet + API key)</option>
+            </select>
+          </label>
+          <label id="asr-model-label">model
+            <select id="asr-model">
+              <option value="tiny">tiny (fastest)</option>
+              <option value="base">base</option>
+              <option value="small" selected>small</option>
+              <option value="medium">medium (slower, more accurate)</option>
+            </select>
+          </label>
+          <label id="asr-key-label" class="hidden">Groq API key
+            <input id="asr-key" type="password" style="width:220px"
+                  placeholder="leave blank to use GROQ_API_KEY env var">
+          </label>
+          <label>language <input id="asr-lang" placeholder="auto" style="width:64px"></label>
+          <button id="transcribe">Transcribe audio</button>
+          <span class="spacer"></span>
+          <span id="asr-busy" class="hidden" style="color:var(--accent)">transcribing ...</span>
+        </div>
+        <div class="transcript" id="transcript"></div>
+        <div class="empty-note" id="transcript-empty">
+          No transcript yet. Click "Transcribe audio" — the first run downloads the speech
+          model, after that it works offline. Click a line to jump to it, or
+          <b>+ range</b> to mark exactly that spoken segment.
+        </div>
+      </fieldset>
+
+      <fieldset>
         <legend>Output</legend>
         <div class="opts">
           <label>file <input id="output" spellcheck="false"></label>
@@ -206,6 +253,7 @@
 const state = {
   dir: '', files: [], current: null, duration: 0,
   ranges: [], rangeMode: 'cut', pending: null, polling: null,
+  transcript: [], transcribePolling: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -300,6 +348,14 @@ function selectFile(index) {
   state.ranges = [];
   state.pending = null;
   state.duration = file.duration || 0;
+  state.transcript = [];
+  clearInterval(state.transcribePolling);
+  setAsrBusy(false);
+  el('transcript').innerHTML = '';
+  el('transcript-empty').classList.remove('hidden');
+  el('transcript-empty').textContent = 'No transcript yet. Click "Transcribe audio" — the '
+    + 'first run downloads the speech model, after that it works offline. Click a line to '
+    + 'jump to it, or + range to mark exactly that spoken segment.';
 
   document.querySelectorAll('.row.file').forEach((row, i) => {
     row.classList.toggle('active', i === index);
@@ -484,6 +540,76 @@ function setBusy(busy) {
   el('preview').disabled = busy;
 }
 
+// ------------------------------------------------------------------ speech to text
+
+async function startTranscribe() {
+  if (!state.current) return;
+  state.transcript = [];
+  el('transcript').innerHTML = '';
+  el('transcript-empty').classList.remove('hidden');
+  el('transcript-empty').textContent = 'Working ... this can take a while on the first '
+    + 'run, while the speech model downloads.';
+  setAsrBusy(true);
+
+  const payload = {
+    input: state.current.path,
+    engine: el('asr-engine').value,
+    model: el('asr-model').value,
+    language: el('asr-lang').value.trim(),
+    groq_api_key: el('asr-key').value.trim(),
+  };
+  const res = await fetch('/api/transcribe', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (data.error) {
+    setAsrBusy(false);
+    el('transcript-empty').textContent = data.error;
+    return;
+  }
+  pollTranscribe(data.job);
+}
+
+function pollTranscribe(jobId) {
+  clearInterval(state.transcribePolling);
+  state.transcribePolling = setInterval(async () => {
+    const res = await fetch('/api/job/' + jobId);
+    const job = await res.json();
+    if (job.segments && job.segments.length > state.transcript.length) {
+      state.transcript = job.segments;
+      renderTranscript();
+    }
+    if (job.status !== 'running') {
+      clearInterval(state.transcribePolling);
+      setAsrBusy(false);
+      if (job.status === 'error') {
+        el('transcript-empty').classList.remove('hidden');
+        el('transcript-empty').textContent = 'Failed: ' + (job.error || 'unknown error');
+      } else if (!state.transcript.length) {
+        el('transcript-empty').classList.remove('hidden');
+        el('transcript-empty').textContent = 'No speech detected in this audio.';
+      }
+    }
+  }, 700);
+}
+
+function renderTranscript() {
+  el('transcript-empty').classList.toggle('hidden', state.transcript.length > 0);
+  const rows = state.transcript.map((seg, i) => `
+    <div class="seg">
+      <span class="t" data-jump="${i}">${fmt(seg.start)}</span>
+      <span class="txt" data-jump="${i}">${escapeHtml(seg.text)}</span>
+      <button class="icon" data-mark="${i}" title="Mark exactly this spoken segment as a range">+ range</button>
+    </div>`);
+  el('transcript').innerHTML = rows.join('');
+}
+
+function setAsrBusy(busy) {
+  el('asr-busy').classList.toggle('hidden', !busy);
+  el('transcribe').disabled = busy;
+}
+
 function joinPath(dir, name) {
   const sep = dir.includes('\\') ? '\\' : '/';
   return dir.endsWith(sep) ? dir + name : dir + sep + name;
@@ -555,6 +681,23 @@ el('result').addEventListener('click', async (ev) => {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: reveal.dataset.reveal }),
     });
+  }
+});
+
+el('transcribe').addEventListener('click', startTranscribe);
+el('asr-engine').addEventListener('change', () => {
+  const isGroq = el('asr-engine').value === 'groq';
+  el('asr-model-label').classList.toggle('hidden', isGroq);
+  el('asr-key-label').classList.toggle('hidden', !isGroq);
+});
+el('transcript').addEventListener('click', (ev) => {
+  const jump = ev.target.closest('[data-jump]');
+  if (jump) { player.currentTime = state.transcript[Number(jump.dataset.jump)].start; return; }
+  const mark = ev.target.closest('[data-mark]');
+  if (mark) {
+    const seg = state.transcript[Number(mark.dataset.mark)];
+    addRange(seg.start, seg.end);
+    render();
   }
 });
 
