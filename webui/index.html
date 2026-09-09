@@ -47,12 +47,17 @@
   .folder-bar input { flex: 1; min-width: 0; font-size: 12px; }
   .files { overflow-y: auto; max-height: calc(100vh - 100px); }
   .row {
-    display: block; width: 100%; text-align: left; background: none; border: 0;
-    border-bottom: 1px solid #23304a; border-radius: 0; padding: 8px 12px;
+    display: flex; align-items: center; border-bottom: 1px solid #23304a;
   }
-  .row:hover { background: #1c2841; border-color: #23304a; }
+  .row:hover { background: #1c2841; }
   .row.dir { color: var(--muted); }
   .row.active { background: #1c3247; box-shadow: inset 2px 0 0 var(--accent); }
+  .row .rowmain {
+    flex: 1; min-width: 0; display: block; text-align: left; background: none;
+    border: 0; border-radius: 0; padding: 8px 6px 8px 12px;
+  }
+  .row .rowmain:hover { border-color: transparent; }
+  .row .addjoin { flex: 0 0 auto; margin-right: 8px; padding: 2px 8px; }
   .row .name { display: block; word-break: break-all; }
   .row .meta { display: block; font-size: 11px; color: var(--muted); margin-top: 2px; }
 
@@ -95,7 +100,7 @@
   .run { background: #0369a1; border-color: #0284c7; font-weight: 600; padding: 7px 18px; }
   .run:hover:not(:disabled) { background: #0284c7; }
 
-  pre#log {
+  pre#log, pre.log {
     margin: 14px 0 0; background: #060b16; border: 1px solid var(--line); border-radius: 6px;
     padding: 10px 12px; font: 12px/1.5 ui-monospace, Consolas, monospace;
     white-space: pre-wrap; max-height: 240px; overflow-y: auto; color: #cbd5e1;
@@ -124,6 +129,7 @@
 <header>
   <h1>Video Cutter</h1>
   <span class="tag">local · nothing is uploaded</span>
+  <button id="toggle-joiner" style="margin-left:10px">🔗 Join videos</button>
   <span class="hint">
     <kbd>space</kbd> play &nbsp; <kbd>←</kbd><kbd>→</kbd> 1s &nbsp; <kbd>J</kbd><kbd>L</kbd> 5s
     &nbsp; <kbd>I</kbd> start &nbsp; <kbd>O</kbd> end
@@ -246,6 +252,38 @@
       <pre id="log" class="hidden"></pre>
       <div id="result" class="result hidden"></div>
     </section>
+
+    <section id="joiner" class="hidden">
+      <h2 style="margin:16px 0 6px;font-size:15px;">Join videos</h2>
+      <div class="empty-note" id="joiner-hint">
+        Click the ＋ next to files in the list on the left to add them here, in the
+        order you want them joined together.
+      </div>
+      <div class="transcript" id="join-queue"></div>
+
+      <fieldset>
+        <legend>Output</legend>
+        <div class="opts">
+          <label>file <input id="join-output" spellcheck="false" placeholder="joined.mp4"></label>
+          <label>
+            <select id="join-mode">
+              <option value="reencode">precise (re-encode, handles mismatched videos)</option>
+              <option value="copy">fast (no re-encode, needs identical format)</option>
+            </select>
+          </label>
+          <label id="join-crf-label">quality <input id="join-crf" type="number" min="0" max="51" value="20" style="width:64px"></label>
+        </div>
+      </fieldset>
+
+      <div class="bar">
+        <button class="run" id="join-run" disabled>Join it</button>
+        <span class="spacer"></span>
+        <span id="join-busy" class="hidden" style="color:var(--accent)">working ...</span>
+      </div>
+
+      <pre id="join-log" class="log hidden"></pre>
+      <div id="join-result" class="result hidden"></div>
+    </section>
   </main>
 </div>
 
@@ -254,6 +292,7 @@ const state = {
   dir: '', files: [], current: null, duration: 0,
   ranges: [], rangeMode: 'cut', pending: null, polling: null,
   transcript: [], transcribePolling: null,
+  joinQueue: [], joinPolling: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -322,15 +361,18 @@ async function loadDir(path) {
 
   const parts = [];
   for (const d of data.dirs) {
-    parts.push(`<button class="row dir" data-dir="${escapeAttr(d.path)}">
-      <span class="name">📁 ${escapeHtml(d.name)}</span></button>`);
+    parts.push(`<div class="row dir">
+      <button class="rowmain" data-dir="${escapeAttr(d.path)}">
+        <span class="name">📁 ${escapeHtml(d.name)}</span></button></div>`);
   }
   data.files.forEach((f, i) => {
     const meta = [f.duration != null ? fmt(f.duration) : 'unknown length',
                   (f.size / 1048576).toFixed(1) + ' MB'].join(' · ');
-    parts.push(`<button class="row file" data-index="${i}">
-      <span class="name">${escapeHtml(f.name)}</span>
-      <span class="meta">${meta}</span></button>`);
+    parts.push(`<div class="row file">
+      <button class="rowmain" data-index="${i}">
+        <span class="name">${escapeHtml(f.name)}</span>
+        <span class="meta">${meta}</span></button>
+      <button class="icon addjoin" data-add="${i}" title="Add to join queue">＋</button></div>`);
   });
   if (!data.dirs.length && !data.files.length) parts.push('<div class="empty-note">No videos here.</div>');
   el('files').innerHTML = parts.join('');
@@ -610,6 +652,88 @@ function setAsrBusy(busy) {
   el('transcribe').disabled = busy;
 }
 
+// ------------------------------------------------------------------------ join
+
+function addToJoinQueue(index) {
+  const file = state.files[index];
+  if (!file) return;
+  if (state.joinQueue.some((item) => item.path === file.path)) return;
+  state.joinQueue.push({ path: file.path, name: file.name });
+  el('joiner').classList.remove('hidden');
+  if (!el('join-output').value.trim()) el('join-output').value = 'joined.mp4';
+  renderJoinQueue();
+}
+
+function renderJoinQueue() {
+  const rows = state.joinQueue.map((item, i) => `
+    <div class="seg">
+      <span class="t">${i + 1}.</span>
+      <span class="txt" style="cursor:default">${escapeHtml(item.name)}</span>
+      <button class="icon" data-jmove="${i}" data-dir="-1" ${i === 0 ? 'disabled' : ''} title="Move up">↑</button>
+      <button class="icon" data-jmove="${i}" data-dir="1" ${i === state.joinQueue.length - 1 ? 'disabled' : ''} title="Move down">↓</button>
+      <button class="icon" data-jdel="${i}" title="Remove">✕</button>
+    </div>`);
+  el('join-queue').innerHTML = rows.join('');
+  el('joiner-hint').classList.toggle('hidden', state.joinQueue.length > 0);
+  el('join-run').disabled = state.joinQueue.length < 2;
+}
+
+async function runJoin() {
+  if (state.joinQueue.length < 2) return;
+  const output = el('join-output').value.trim() || 'joined.mp4';
+  const payload = {
+    inputs: state.joinQueue.map((item) => item.path),
+    output: !/[\\/]/.test(output) ? joinPath(state.dir, output) : output,
+    mode: el('join-mode').value,
+    crf: Number(el('join-crf').value) || 20,
+  };
+
+  el('join-log').textContent = '';
+  el('join-log').classList.remove('hidden');
+  el('join-result').classList.add('hidden');
+  setJoinBusy(true);
+
+  const res = await fetch('/api/join', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (data.error) { finishJoin({ status: 'error', error: data.error }); return; }
+  pollJoin(data.job);
+}
+
+function pollJoin(jobId) {
+  clearInterval(state.joinPolling);
+  state.joinPolling = setInterval(async () => {
+    const res = await fetch('/api/job/' + jobId);
+    const job = await res.json();
+    el('join-log').textContent = job.log || '';
+    el('join-log').scrollTop = el('join-log').scrollHeight;
+    if (job.status !== 'running') { clearInterval(state.joinPolling); finishJoin(job); }
+  }, 600);
+}
+
+function finishJoin(job) {
+  setJoinBusy(false);
+  const box = el('join-result');
+  box.classList.remove('hidden');
+  if (job.status === 'error') {
+    box.classList.add('bad');
+    box.innerHTML = `<b>Failed:</b> <span class="path">${escapeHtml(job.error || 'unknown error')}</span>`;
+    return;
+  }
+  box.classList.remove('bad');
+  const path = job.output;
+  box.innerHTML = `<b>Done</b> — <span class="path">${escapeHtml(path)}</span>
+    <button class="icon" data-play="${escapeAttr(path)}">Play</button>
+    <button class="icon" data-reveal="${escapeAttr(path)}">Show in folder</button>`;
+}
+
+function setJoinBusy(busy) {
+  el('join-busy').classList.toggle('hidden', !busy);
+  el('join-run').disabled = busy || state.joinQueue.length < 2;
+}
+
 function joinPath(dir, name) {
   const sep = dir.includes('\\') ? '\\' : '/';
   return dir.endsWith(sep) ? dir + name : dir + sep + name;
@@ -622,10 +746,12 @@ el('dir').addEventListener('keydown', (ev) => { if (ev.key === 'Enter') loadDir(
 el('up').addEventListener('click', () => { if (state.parent) loadDir(state.parent); });
 
 el('files').addEventListener('click', (ev) => {
-  const row = ev.target.closest('.row');
-  if (!row) return;
-  if (row.dataset.dir !== undefined) loadDir(row.dataset.dir);
-  else selectFile(Number(row.dataset.index));
+  const add = ev.target.closest('[data-add]');
+  if (add) { addToJoinQueue(Number(add.dataset.add)); return; }
+  const main = ev.target.closest('.rowmain');
+  if (!main) return;
+  if (main.dataset.dir !== undefined) loadDir(main.dataset.dir);
+  else selectFile(Number(main.dataset.index));
 });
 
 document.querySelectorAll('[data-seek]').forEach((btn) => {
@@ -698,6 +824,38 @@ el('transcript').addEventListener('click', (ev) => {
     const seg = state.transcript[Number(mark.dataset.mark)];
     addRange(seg.start, seg.end);
     render();
+  }
+});
+
+el('toggle-joiner').addEventListener('click', () => el('joiner').classList.toggle('hidden'));
+el('join-queue').addEventListener('click', (ev) => {
+  const move = ev.target.closest('[data-jmove]');
+  if (move) {
+    const i = Number(move.dataset.jmove), j = i + Number(move.dataset.dir);
+    if (j < 0 || j >= state.joinQueue.length) return;
+    [state.joinQueue[i], state.joinQueue[j]] = [state.joinQueue[j], state.joinQueue[i]];
+    renderJoinQueue();
+    return;
+  }
+  const del = ev.target.closest('[data-jdel]');
+  if (del) { state.joinQueue.splice(Number(del.dataset.jdel), 1); renderJoinQueue(); }
+});
+el('join-run').addEventListener('click', runJoin);
+el('join-result').addEventListener('click', async (ev) => {
+  const play = ev.target.closest('[data-play]');
+  if (play) {
+    el('placeholder').classList.add('hidden');
+    el('editor').classList.remove('hidden');
+    player.src = '/api/media?path=' + encodeURIComponent(play.dataset.play);
+    player.play().catch(() => {});
+    return;
+  }
+  const reveal = ev.target.closest('[data-reveal]');
+  if (reveal) {
+    await fetch('/api/reveal', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ path: reveal.dataset.reveal }),
+    });
   }
 });
 

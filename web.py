@@ -233,6 +233,47 @@ def run_transcribe_job(job, source, engine, model_size, language, groq_api_key):
             job["status"] = "error"
 
 
+@app.route("/api/join", methods=["POST"])
+def api_join():
+    """Start a video join in the background and hand back a job id to poll."""
+    payload = request.json or {}
+    inputs = payload.get("inputs") or []
+    if len(inputs) < 2:
+        return jsonify({"error": "need at least two videos to join"}), 400
+
+    kwargs = {
+        "sources": inputs,
+        "output": (payload.get("output") or "").strip() or "joined.mp4",
+        "mode": "copy" if payload.get("mode") == "copy" else "reencode",
+        "crf": int(payload.get("crf") or 20),
+        "preset": payload.get("preset") or "veryfast",
+        "verbose": False,
+    }
+
+    job_id = uuid.uuid4().hex[:12]
+    job = {"id": job_id, "status": "running", "log": "", "output": None, "error": None}
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+
+    thread = threading.Thread(target=run_join_job, args=(job, kwargs), daemon=True)
+    thread.start()
+    return jsonify({"job": job_id})
+
+
+def run_join_job(job, kwargs):
+    writer = LogWriter(job)
+    try:
+        with redirect_stdout(writer):
+            output = vc.join_videos(**kwargs)
+        with JOBS_LOCK:
+            job["output"] = str(output)
+            job["status"] = "done"
+    except Exception as ex:
+        with JOBS_LOCK:
+            job["error"] = str(ex)
+            job["status"] = "error"
+
+
 @app.route("/api/job/<job_id>")
 def api_job(job_id):
     with JOBS_LOCK:

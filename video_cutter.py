@@ -496,6 +496,141 @@ def cut_video(source, cuts=(), keeps=(), output=None, mode="reencode", separate=
     return [target]
 
 
+# --------------------------------------------------------------------- joining
+
+def probe_video_stream(path):
+    """Return (width, height, fps, has_audio) for one file."""
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+         "stream=width,height,r_frame_rate", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    try:
+        streams = json.loads(res.stdout or "{}").get("streams", [])
+    except json.JSONDecodeError:
+        streams = []
+    if not streams:
+        raise RuntimeError(f"{path}: no video stream found - is it a video file?")
+    width, height = streams[0].get("width"), streams[0].get("height")
+    rate = streams[0].get("r_frame_rate") or "30/1"
+    try:
+        num, den = rate.split("/")
+        fps = float(num) / float(den) if float(den) else 30.0
+    except (ValueError, ZeroDivisionError):
+        fps = 30.0
+
+    res_a = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries",
+         "stream=index", "-of", "json", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    try:
+        has_audio = bool(json.loads(res_a.stdout or "{}").get("streams"))
+    except json.JSONDecodeError:
+        has_audio = False
+    return width, height, fps, has_audio
+
+
+def join_videos(sources, output, mode="reencode", crf=20, preset="veryfast",
+                width=None, height=None, fps=None, verbose=False):
+    """Join several videos, in the given order, into one file.
+
+    mode="copy" is fast but only works when every input already shares the same
+    codec/resolution/frame rate (e.g. pieces produced by this tool's own
+    --separate). mode="reencode" (default) decodes everything and scales/pads it
+    onto one common canvas first, so it can join videos of different phones,
+    resolutions, or frame rates. Returns the output path.
+    """
+    sources = [Path(s) for s in sources]
+    if len(sources) < 2:
+        raise RuntimeError("need at least two videos to join")
+    for s in sources:
+        if not s.is_file():
+            raise RuntimeError(f"no such file: {s}")
+
+    output = Path(output)
+    if any(output.resolve() == s.resolve() for s in sources):
+        raise RuntimeError("the output would overwrite one of the inputs - pick another name")
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"\njoining {len(sources)} video(s) -> {output.name}")
+    for i, s in enumerate(sources, 1):
+        print(f"  {i}. {s.name}")
+
+    if mode == "copy":
+        list_file = output.parent / f".{output.stem}_concat.txt"
+        lines = []
+        for s in sources:
+            escaped = str(s.resolve()).replace("'", "'\\''")
+            lines.append(f"file '{escaped}'")
+        list_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        try:
+            run_ffmpeg(["-f", "concat", "-safe", "0", "-i", str(list_file),
+                        "-c", "copy", str(output)], verbose)
+        except RuntimeError as ex:
+            raise RuntimeError(
+                f"{ex}\n  copy mode needs matching codecs/resolution/frame rate "
+                "across every input - try --mode reencode instead"
+            )
+        finally:
+            list_file.unlink(missing_ok=True)
+        print(f"  wrote {output}  ({output.stat().st_size / 1_048_576:.1f} MB)")
+        return output
+
+    # reencode: decode everything, scale+pad onto one common canvas, re-encode.
+    infos = [probe_video_stream(s) for s in sources]
+    target_w = width or max(w for w, h, f, a in infos)
+    target_h = height or max(h for w, h, f, a in infos)
+    target_w -= target_w % 2  # x264 needs even dimensions
+    target_h -= target_h % 2
+    target_fps = fps or infos[0][2]
+    any_audio = any(a for w, h, f, a in infos)
+
+    args = []
+    for s in sources:
+        args += ["-i", str(s)]
+
+    filter_parts, concat_inputs = [], []
+    for i, (w, h, f, has_audio) in enumerate(infos):
+        filter_parts.append(
+            f"[{i}:v]scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={target_fps}[v{i}]"
+        )
+        concat_inputs.append(f"[v{i}]")
+        if any_audio:
+            if has_audio:
+                filter_parts.append(
+                    f"[{i}:a]aformat=sample_rates=48000:channel_layouts=stereo[a{i}]"
+                )
+            else:
+                # This input has no audio track - fill the gap with silence so the
+                # concat filter still gets an audio stream from every segment.
+                duration = probe_duration(sources[i])
+                filter_parts.append(
+                    f"anullsrc=channel_layout=stereo:sample_rate=48000,"
+                    f"atrim=duration={duration:.3f}[a{i}]"
+                )
+            concat_inputs.append(f"[a{i}]")
+
+    concat_expr = "".join(concat_inputs) + (
+        f"concat=n={len(sources)}:v=1:a={1 if any_audio else 0}[outv]"
+        + ("[outa]" if any_audio else "")
+    )
+    filter_complex = ";".join(filter_parts) + ";" + concat_expr
+
+    args += ["-filter_complex", filter_complex, "-map", "[outv]"]
+    if any_audio:
+        args += ["-map", "[outa]"]
+    args += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf), "-pix_fmt", "yuv420p"]
+    if any_audio:
+        args += ["-c:a", "aac", "-b:a", "192k"]
+    args.append(str(output))
+
+    run_ffmpeg(args, verbose)
+    print(f"  wrote {output}  ({output.stat().st_size / 1_048_576:.1f} MB)")
+    return output
+
+
 def load_jobs(config_path):
     """Read a batch edit list: either a bare list of jobs, or {"jobs": [...]}."""
     data = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -523,8 +658,11 @@ def main():
   video_cutter.py talk.mp4 --info                           # duration and streams
   video_cutter.py talk.mp4 --transcribe                     # speech to text, printed
   video_cutter.py talk.mp4 --transcribe -o talk.srt          # ... written as subtitles
+  video_cutter.py --join part1.mp4 part2.mp4 part3.mp4 -o full.mp4
 """)
     parser.add_argument("input", nargs="?", help="the video to cut")
+    parser.add_argument("--join", nargs="+", metavar="FILE",
+                        help="join these 2+ videos, in the order given, into -o OUTPUT")
     parser.add_argument("--cut", action="append", default=[], metavar="START-END",
                         help="range to remove, e.g. 0:10-0:25 (repeatable)")
     parser.add_argument("--keep", action="append", default=[], metavar="START-END",
@@ -560,6 +698,15 @@ def main():
 
     try:
         require_tools()
+
+        if args.join:
+            if len(args.join) < 2:
+                parser.error("--join needs at least two files")
+            if not args.output:
+                parser.error("--join needs -o/--output")
+            join_videos(args.join, args.output, mode=args.mode, crf=args.crf,
+                       preset=args.preset, verbose=args.verbose)
+            return 0
 
         if args.info:
             if not args.input:
