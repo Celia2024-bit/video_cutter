@@ -11,6 +11,31 @@ A thin wrapper around ffmpeg: no library to install, the input is never modified
 ffmpeg -version        # if this prints a version, you are ready
 ```
 
+## Installer (Windows / Mac)
+
+People who just want to double-click and use the page do not need Python.
+
+**Windows (built on this PC):** unzip `dist/VideoCutter-windows.zip`. Either run `VideoCutter.exe` (portable) or double-click `Install-VideoCutter.cmd` to copy it into `%LOCALAPPDATA%\Programs\VideoCutter` and put a **Video Cutter** icon on the Desktop. Click that icon: a console window stays open and the browser opens `http://127.0.0.1:8770`. Close the console window to quit.
+
+To rebuild:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging/build_windows.ps1
+```
+
+A next-next-next `VideoCutter-Setup.exe` is produced if [Inno Setup 6](https://jrsoftware.org/isinfo.php) is installed.
+
+**Mac:** PyInstaller cannot cross-compile from Windows. On a Mac:
+
+```bash
+chmod +x packaging/macos/build.sh
+./packaging/macos/build.sh
+```
+
+That writes `dist/Video Cutter.app` and `dist/VideoCutter-macos.dmg`. First launch: right-click the app → Open (Gatekeeper).
+
+Local speech-to-text still downloads a Whisper model on first use. Groq needs an API key.
+
 ## The web UI (easiest)
 
 ```bash

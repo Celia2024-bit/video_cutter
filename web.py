@@ -13,6 +13,7 @@ not expose it.
 import argparse
 import io
 import mimetypes
+import os
 import subprocess
 import sys
 import threading
@@ -24,10 +25,50 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_file, send_from_directory
 
 # Importing our own CLI keeps one implementation of the cutting logic.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+def resource_root():
+    """Folder that holds webui/ — the project dir, or PyInstaller's unpack dir."""
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    return Path(__file__).resolve().parent
+
+
+def prepend_bundled_ffmpeg():
+    """Put a shipped ffmpeg ahead of PATH so the installed app does not need one."""
+    roots = []
+    if getattr(sys, "frozen", False):
+        roots.append(Path(sys.executable).parent)
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            roots.append(Path(meipass))
+    else:
+        roots.append(Path(__file__).resolve().parent)
+    found = []
+    names = ("ffmpeg.exe", "ffmpeg")
+    for root in roots:
+        for folder in (root, root / "ffmpeg", root / "ffmpeg" / "bin", root / "bin"):
+            if any((folder / name).is_file() for name in names):
+                found.append(str(folder))
+    if found:
+        os.environ["PATH"] = os.pathsep.join(found) + os.pathsep + os.environ.get("PATH", "")
+
+
+def default_media_dir():
+    """Videos/Movies folder when this is an installed app; otherwise the project dir."""
+    if not getattr(sys, "frozen", False):
+        return Path(__file__).resolve().parent
+    home = Path.home()
+    for name in ("Videos", "Movies", "Desktop"):
+        candidate = home / name
+        if candidate.is_dir():
+            return candidate
+    return home
+
+
+prepend_bundled_ffmpeg()
+sys.path.insert(0, str(resource_root()))
 import video_cutter as vc
 
-HERE = Path(__file__).resolve().parent
+HERE = resource_root()
 
 VIDEO_SUFFIXES = {
     ".mp4", ".m4v", ".mov", ".mkv", ".webm", ".avi", ".wmv", ".flv",
@@ -466,7 +507,7 @@ def api_reveal():
 
 def main():
     parser = argparse.ArgumentParser(description="Local web UI for video_cutter.")
-    parser.add_argument("--dir", default=".", help="folder to start in (default: .)")
+    parser.add_argument("--dir", default=None, help="folder to start in (default: Videos, or this project)")
     parser.add_argument("--port", type=int, default=8770)
     parser.add_argument("--host", default="127.0.0.1",
                         help="keep the default unless you know why you are changing it")
@@ -481,19 +522,17 @@ def main():
         return 1
 
     # The starting folder travels in the query string; the page asks /api/list for it.
-    start_dir = Path(args.dir).expanduser().resolve()
+    start_dir = Path(args.dir or default_media_dir()).expanduser().resolve()
     url = f"http://{args.host}:{args.port}/?dir={start_dir}"
-    print(f"video_cutter web UI -> http://{args.host}:{args.port}")
+    print(f"Video Cutter -> {url}")
     print(f"  starting folder: {start_dir}")
     print(f"  features: {', '.join(SERVER_FEATURES)}")
-    print("  press Ctrl+C to stop")
-    print("  if export fails with HTML/JSON errors, this window is not the one serving")
-    print("  the browser — close other python.exe processes and start this again")
+    print("  close this window to quit")
     if not args.no_browser:
-        # The browser is on this machine, so opening it here actually works.
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
-    app.run(host=args.host, port=args.port, threaded=True)
+    # The reloader spawns a second process and breaks the frozen .exe.
+    app.run(host=args.host, port=args.port, threaded=True, use_reloader=False)
     return 0
 
 
