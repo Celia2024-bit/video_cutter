@@ -1,0 +1,14 @@
+# Videos live here while you work on them - they do not belong in git.
+*.mp4
+*.mkv
+*.mov
+*.m4v
+*.webm
+*.avi
+*.ts
+
+__pycache__/
+dist/
+build/
+packaging/cache/
+packaging/.venv/
