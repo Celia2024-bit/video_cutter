@@ -1,0 +1,67 @@
+name: Build installers
+
+# Push a tag like v1.0 to build both installers and publish them on the
+# repo's Releases page. "Run workflow" (Actions tab) builds them without
+# releasing; the files are then under that run's Artifacts.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build (zip + Setup.exe)
+        shell: pwsh
+        run: powershell -ExecutionPolicy Bypass -File packaging/build_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: |
+            dist/VideoCutter-windows.zip
+            dist/VideoCutter-Setup.exe
+          if-no-files-found: error
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Make sure no Homebrew ffmpeg gets bundled
+        # Brew's ffmpeg links to libraries that only exist on this runner;
+        # build.sh falls back to a self-contained static build when none is on PATH.
+        run: |
+          brew uninstall --ignore-dependencies ffmpeg || true
+          ! command -v ffmpeg
+      - name: Build (.app + .dmg)
+        run: |
+          chmod +x packaging/macos/build.sh
+          ./packaging/macos/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/VideoCutter-macos.dmg
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: out/*
+          generate_release_notes: true

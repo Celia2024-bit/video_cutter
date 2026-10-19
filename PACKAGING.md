@@ -80,6 +80,24 @@ chmod +x packaging/macos/build.sh
 
 ---
 
+## 自动构建（GitHub Actions）
+
+不想每次本地编译：推一个 tag，GitHub 会同时在 Windows 和 Mac 机器上编好，
+放到仓库的 **Releases** 页面，直接点击下载。
+
+```bash
+git tag v1.0
+git push origin v1.0
+```
+
+几分钟到十几分钟后，Releases 里会出现 `VideoCutter-windows.zip`、`VideoCutter-Setup.exe`、
+`VideoCutter-macos.dmg`。只想试编、不发布：Actions 页 → Build installers → Run workflow，
+文件在那次运行的 Artifacts 里。配置在 `.github/workflows/release.yml`。
+
+注意：Mac 包里的 ffmpeg 是 x86_64 静态版，在 Apple 芯片上靠 Rosetta 运行。
+
+---
+
 ## 发给别人时带哪个
 
 | 对方系统 | 你发这个 | 不要发 |
