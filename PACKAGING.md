@@ -94,7 +94,7 @@ git push origin v1.0
 `VideoCutter-macos.dmg`。只想试编、不发布：Actions 页 → Build installers → Run workflow，
 文件在那次运行的 Artifacts 里。配置在 `.github/workflows/release.yml`。
 
-注意：Mac 包里的 ffmpeg 是 x86_64 静态版，在 Apple 芯片上靠 Rosetta 运行。
+注意：流水线编出来的 Mac 包是 Apple 芯片（arm64）版，Intel Mac 打不开。
 
 ---
 

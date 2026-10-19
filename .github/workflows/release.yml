@@ -34,12 +34,20 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Make sure no Homebrew ffmpeg gets bundled
-        # Brew's ffmpeg links to libraries that only exist on this runner;
-        # build.sh falls back to a self-contained static build when none is on PATH.
+      - name: Fetch a self-contained (static) arm64 ffmpeg
+        # Brew's ffmpeg links to libraries that only exist on this runner, so it
+        # cannot be bundled. build.sh copies whichever ffmpeg/ffprobe is first on PATH.
         run: |
-          brew uninstall --ignore-dependencies ffmpeg || true
-          ! command -v ffmpeg
+          mkdir -p "$RUNNER_TEMP/ff"
+          for tool in ffmpeg ffprobe; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tool.zip" \
+              "https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/$tool.zip"
+            unzip -o "$RUNNER_TEMP/$tool.zip" -d "$RUNNER_TEMP/ff"
+          done
+          chmod +x "$RUNNER_TEMP/ff/"*
+          "$RUNNER_TEMP/ff/ffmpeg" -version | head -1
+          "$RUNNER_TEMP/ff/ffprobe" -version | head -1
+          echo "$RUNNER_TEMP/ff" >> "$GITHUB_PATH"
       - name: Build (.app + .dmg)
         run: |
           chmod +x packaging/macos/build.sh
