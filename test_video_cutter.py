@@ -367,5 +367,39 @@ class ExportSubsApiTests(unittest.TestCase):
         self.assertIn("export-subs", res.get_json().get("features", []))
 
 
+def _tone(path, seconds=2):
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", f"sine=frequency=440:d={seconds}", str(path)],
+        check=True, capture_output=True,
+    )
+
+
+class EditAudioTests(unittest.TestCase):
+    def test_remove_replace_and_mix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            video, tone = tmp / "v.mp4", tmp / "tone.wav"
+            _tiny_video(video)
+            _tone(tone)
+            self.assertFalse(vc.has_audio_stream(video))
+
+            replaced = vc.edit_audio(video, tmp / "r.mp4", "replace", audio=tone)
+            self.assertTrue(vc.has_audio_stream(replaced))
+
+            mixed = vc.edit_audio(replaced, tmp / "m.mp4", "mix", audio=tone, volume=0.5)
+            self.assertTrue(vc.has_audio_stream(mixed))
+
+            muted = vc.edit_audio(mixed, tmp / "x.mp4", "remove")
+            self.assertFalse(vc.has_audio_stream(muted))
+
+    def test_refuses_to_overwrite_input(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            video = Path(tmp) / "v.mp4"
+            _tiny_video(video)
+            with self.assertRaises(RuntimeError):
+                vc.edit_audio(video, video, "remove")
+
+
 if __name__ == "__main__":
     unittest.main()

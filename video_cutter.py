@@ -1009,6 +1009,77 @@ def join_videos(sources, output, mode="reencode", crf=20, preset="veryfast",
     return output
 
 
+def has_audio_stream(path):
+    """True when the file has at least one audio stream."""
+    res = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
+         "stream=index", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+    )
+    return res.returncode == 0 and bool(res.stdout.strip())
+
+
+def edit_audio(source, output=None, action="remove", audio=None, volume=1.0,
+               original_volume=1.0, verbose=False):
+    """Strip the sound from a video, or replace / mix it with another audio file.
+
+    action: "remove"  - drop every audio stream, copy the picture untouched
+            "replace" - swap the sound for `audio` (cut to the video's length)
+            "mix"     - lay `audio` over the original sound
+    The picture is never re-encoded. `volume` scales the new audio and
+    `original_volume` the existing sound (only used by "mix").
+    """
+    source = Path(source)
+    if not source.is_file():
+        raise RuntimeError(f"no such file: {source}")
+    if action not in {"remove", "replace", "mix"}:
+        raise ValueError(f"unknown audio action: {action}")
+    if action != "remove":
+        if not audio:
+            raise RuntimeError(f"audio {action} needs an audio file")
+        audio = Path(audio)
+        if not audio.is_file():
+            raise RuntimeError(f"no such audio file: {audio}")
+    if volume < 0 or original_volume < 0:
+        raise ValueError("volume cannot be negative")
+
+    suffix = source.suffix.lower() or ".mp4"
+    if action != "remove" and suffix not in REENCODE_CONTAINERS:
+        print(f"  note: {suffix} cannot hold AAC, writing .mp4 instead")
+        suffix = ".mp4"
+    tag = {"remove": "muted", "replace": "audio", "mix": "mixed"}[action]
+    if output:
+        target = Path(output)
+        if target.is_dir():
+            target = target / f"{source.stem}_{tag}{suffix}"
+    else:
+        target = source.with_name(f"{source.stem}_{tag}{suffix}")
+    if target.resolve() == source.resolve():
+        raise RuntimeError("the output would overwrite the input - pick another name")
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    if action == "remove":
+        print(f"\n{source.name}  removing sound -> {target.name}")
+        args = ["-i", str(source), "-map", "0:v", "-c", "copy", "-an", str(target)]
+    else:
+        if action == "mix" and not has_audio_stream(source):
+            action = "replace"
+            print("  note: the video has no sound to mix with, using the new audio alone")
+        print(f"\n{source.name}  {action} sound with {audio.name} -> {target.name}")
+        args = ["-i", str(source), "-i", str(audio), "-map", "0:v"]
+        if action == "replace":
+            args += ["-map", "1:a:0", "-filter:a", f"volume={volume}"]
+        else:
+            args += ["-filter_complex",
+                     f"[0:a:0]volume={original_volume}[a0];[1:a:0]volume={volume}[a1];"
+                     "[a0][a1]amix=inputs=2:duration=first:normalize=0[aout]",
+                     "-map", "[aout]"]
+        args += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(target)]
+    run_ffmpeg(args, verbose)
+    print(f"  wrote {target}  ({target.stat().st_size / 1_048_576:.1f} MB)")
+    return target
+
+
 def load_jobs(config_path):
     """Read a batch edit list: either a bare list of jobs, or {"jobs": [...]}."""
     data = json.loads(Path(config_path).read_text(encoding="utf-8"))
@@ -1036,6 +1107,9 @@ def main():
   video_cutter.py talk.mp4 --info                           # duration and streams
   video_cutter.py talk.mp4 --transcribe                     # speech to text, printed
   video_cutter.py talk.mp4 --transcribe -o talk.srt          # ... written as subtitles
+  video_cutter.py talk.mp4 --mute                           # remove the sound
+  video_cutter.py talk.mp4 --audio music.mp3                # replace the sound
+  video_cutter.py talk.mp4 --audio music.mp3 --mix --volume 0.3   # music under the voice
   video_cutter.py --join part1.mp4 part2.mp4 part3.mp4 -o full.mp4
 """)
     parser.add_argument("input", nargs="?", help="the video to cut")
@@ -1069,6 +1143,16 @@ def main():
                              "(default small, --engine local only)")
     parser.add_argument("--groq-api-key", help="overrides the GROQ_API_KEY env var")
     parser.add_argument("--language", help="speech language code, e.g. en, zh (default: auto-detect)")
+    parser.add_argument("--mute", action="store_true",
+                        help="remove the sound from the video (picture is not re-encoded)")
+    parser.add_argument("--audio", metavar="FILE",
+                        help="replace the video's sound with this audio file")
+    parser.add_argument("--mix", action="store_true",
+                        help="with --audio: keep the original sound and mix the file over it")
+    parser.add_argument("--volume", type=float, default=1.0,
+                        help="volume of the --audio file (default 1.0)")
+    parser.add_argument("--original-volume", type=float, default=1.0,
+                        help="with --mix: volume of the original sound (default 1.0)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print what would be cut and kept, write nothing")
     parser.add_argument("--verbose", action="store_true", help="show ffmpeg output")
@@ -1084,6 +1168,17 @@ def main():
                 parser.error("--join needs -o/--output")
             join_videos(args.join, args.output, mode=args.mode, crf=args.crf,
                        preset=args.preset, verbose=args.verbose)
+            return 0
+
+        if args.mute or args.audio:
+            if not args.input:
+                parser.error("--mute/--audio need an input video")
+            if args.mute and args.audio:
+                parser.error("use either --mute or --audio, not both")
+            edit_audio(args.input, args.output,
+                       action="remove" if args.mute else ("mix" if args.mix else "replace"),
+                       audio=args.audio, volume=args.volume,
+                       original_volume=args.original_volume, verbose=args.verbose)
             return 0
 
         if args.info:

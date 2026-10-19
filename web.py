@@ -85,7 +85,7 @@ MIME_TYPES = {
 app = Flask(__name__, static_folder=None)
 
 # So the page can tell a stale python process (old routes, new HTML) from a current one.
-SERVER_FEATURES = ["cut", "join", "transcribe", "srt", "import-subs", "export-subs"]
+SERVER_FEATURES = ["cut", "join", "transcribe", "srt", "import-subs", "export-subs", "audio"]
 
 # Running jobs, keyed by id. A cut can take minutes, so it runs in a thread and the
 # page polls for the log.
@@ -326,6 +326,56 @@ def run_join_job(job, kwargs):
     try:
         with redirect_stdout(writer):
             output = vc.join_videos(**kwargs)
+        with JOBS_LOCK:
+            job["output"] = str(output)
+            job["status"] = "done"
+    except Exception as ex:
+        with JOBS_LOCK:
+            job["error"] = str(ex)
+            job["status"] = "error"
+
+
+@app.route("/api/audio", methods=["POST"])
+def api_audio():
+    """Remove the sound from a video, or replace / mix it with another audio file."""
+    payload = request.json or {}
+    source = (payload.get("video") or "").strip()
+    if not source:
+        return jsonify({"error": "no video path"}), 400
+    action = payload.get("action") or "remove"
+    if action not in ("remove", "replace", "mix"):
+        return jsonify({"error": "unknown action"}), 400
+    audio = (payload.get("audio") or "").strip()
+    if action != "remove" and not audio:
+        return jsonify({"error": "pick an audio file first"}), 400
+    try:
+        volume = float(payload.get("volume", 1.0))
+        original_volume = float(payload.get("original_volume", 1.0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "volume must be a number"}), 400
+
+    kwargs = {
+        "source": source,
+        "output": (payload.get("output") or "").strip() or None,
+        "action": action,
+        "audio": audio or None,
+        "volume": volume,
+        "original_volume": original_volume,
+        "verbose": False,
+    }
+    job_id = uuid.uuid4().hex[:12]
+    job = {"id": job_id, "status": "running", "log": "", "output": None, "error": None}
+    with JOBS_LOCK:
+        JOBS[job_id] = job
+    threading.Thread(target=run_audio_job, args=(job, kwargs), daemon=True).start()
+    return jsonify({"job": job_id})
+
+
+def run_audio_job(job, kwargs):
+    writer = LogWriter(job)
+    try:
+        with redirect_stdout(writer):
+            output = vc.edit_audio(**kwargs)
         with JOBS_LOCK:
             job["output"] = str(output)
             job["status"] = "done"

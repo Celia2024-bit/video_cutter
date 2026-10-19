@@ -290,6 +290,33 @@
       </fieldset>
 
       <fieldset>
+        <legend>Sound</legend>
+        <div class="opts">
+          <label>
+            <select id="audio-action">
+              <option value="remove">remove the sound</option>
+              <option value="replace">replace with an audio file</option>
+              <option value="mix">mix an audio file over the original</option>
+            </select>
+          </label>
+          <label id="audio-file-wrap" class="hidden">audio file
+            <input id="audio-file" spellcheck="false" style="width:300px"
+                   placeholder="full path, or a name in this folder (mp3, wav, m4a ...)">
+          </label>
+        </div>
+        <div class="opts" id="audio-vol-wrap" style="margin-top:8px">
+          <label>new audio volume <input id="audio-volume" type="number" min="0" max="5" step="0.1" value="1" style="width:64px"></label>
+          <label id="audio-orig-wrap" class="hidden">original volume <input id="audio-orig-volume" type="number" min="0" max="5" step="0.1" value="1" style="width:64px"></label>
+        </div>
+        <div class="opts" style="margin-top:8px">
+          <label>file <input id="audio-output" spellcheck="false" style="width:280px" placeholder="(auto: name_muted.mp4)"></label>
+          <button class="run" id="audio-run" disabled>Apply to video</button>
+          <span id="audio-busy" class="hidden" style="color:var(--accent)">working ...</span>
+        </div>
+        <div class="empty-note">The picture is not re-encoded, so this is fast and lossless. The original file is never changed.</div>
+      </fieldset>
+
+      <fieldset>
         <legend>Output</legend>
         <div class="opts">
           <label>file <input id="output" spellcheck="false"></label>
@@ -491,6 +518,7 @@ function selectFile(index) {
   const file = state.files[index];
   if (!file) return;
   state.current = file;
+  el('audio-run').disabled = false;
   state.ranges = [];
   state.pending = null;
   state.duration = file.duration || 0;
@@ -957,6 +985,87 @@ function pollExport(jobId) {
   }, 600);
 }
 
+// ------------------------------------------------------------------------ sound
+
+function syncAudioForm() {
+  const action = el('audio-action').value;
+  el('audio-file-wrap').classList.toggle('hidden', action === 'remove');
+  el('audio-vol-wrap').classList.toggle('hidden', action === 'remove');
+  el('audio-orig-wrap').classList.toggle('hidden', action !== 'mix');
+  el('audio-output').placeholder = '(auto: name_'
+    + { remove: 'muted', replace: 'audio', mix: 'mixed' }[action] + '.mp4)';
+}
+
+function setAudioBusy(busy) {
+  el('audio-busy').classList.toggle('hidden', !busy);
+  el('audio-run').disabled = busy || !state.current;
+}
+
+function resolveInDir(value) {
+  return value && !/[\\/]/.test(value) ? joinPath(state.dir, value) : value;
+}
+
+async function runAudio() {
+  if (!state.current) return;
+  const action = el('audio-action').value;
+  const audio = resolveInDir(el('audio-file').value.trim());
+  if (action !== 'remove' && !audio) {
+    finish({ status: 'error', error: 'pick an audio file first' });
+    return;
+  }
+  const payload = {
+    video: state.current.path,
+    action,
+    audio,
+    volume: Number(el('audio-volume').value),
+    original_volume: Number(el('audio-orig-volume').value),
+    output: resolveInDir(el('audio-output').value.trim()),
+  };
+
+  el('log').textContent = '';
+  el('log').classList.remove('hidden');
+  el('result').classList.add('hidden');
+  setAudioBusy(true);
+
+  try {
+    const res = await fetch('/api/audio', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await readJson(res);
+    if (data.error) {
+      setAudioBusy(false);
+      finish({ status: 'error', error: data.error });
+      return;
+    }
+    pollAudio(data.job);
+  } catch (ex) {
+    setAudioBusy(false);
+    finish({ status: 'error', error: String(ex.message || ex) });
+  }
+}
+
+function pollAudio(jobId) {
+  clearInterval(state.polling);
+  state.polling = setInterval(async () => {
+    try {
+      const res = await fetch('/api/job/' + jobId);
+      const job = await readJson(res);
+      el('log').textContent = job.log || '';
+      el('log').scrollTop = el('log').scrollHeight;
+      if (job.status !== 'running') {
+        clearInterval(state.polling);
+        setAudioBusy(false);
+        finish(job);
+      }
+    } catch (ex) {
+      clearInterval(state.polling);
+      setAudioBusy(false);
+      finish({ status: 'error', error: String(ex.message || ex) });
+    }
+  }, 600);
+}
+
 // ------------------------------------------------------------------------ join
 
 function addToJoinQueue(index) {
@@ -1117,6 +1226,9 @@ el('result').addEventListener('click', async (ev) => {
 
 el('transcribe').addEventListener('click', startTranscribe);
 el('export-subs').addEventListener('click', exportVideoWithCaptions);
+el('audio-action').addEventListener('change', syncAudioForm);
+el('audio-run').addEventListener('click', runAudio);
+syncAudioForm();
 el('asr-engine').addEventListener('change', () => {
   const isGroq = el('asr-engine').value === 'groq';
   el('asr-model-label').classList.toggle('hidden', isGroq);
