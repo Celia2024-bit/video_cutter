@@ -309,7 +309,7 @@
           <label id="audio-orig-wrap" class="hidden">original volume <input id="audio-orig-volume" type="number" min="0" max="5" step="0.1" value="1" style="width:64px"></label>
         </div>
         <div class="opts" style="margin-top:8px">
-          <label>file <input id="audio-output" spellcheck="false" style="width:280px" placeholder="(auto: name_muted.mp4)"></label>
+          <label>file <input id="audio-output" spellcheck="false" style="width:280px"></label>
           <button class="run" id="audio-run" disabled>Apply to video</button>
           <span id="audio-busy" class="hidden" style="color:var(--accent)">working ...</span>
         </div>
@@ -546,6 +546,8 @@ function selectFile(index) {
   const ext = dot > 0 ? file.name.slice(dot) : '.mp4';
   el('output').value = `${stem}_cut${ext}`;
   el('export-output').value = `${stem}_subs${ext}`;
+  state.audioOutEdited = false;
+  setAudioOutputName();
   el('export-subs').disabled = true;
 
   player.src = '/api/media?path=' + encodeURIComponent(file.path);
@@ -992,8 +994,18 @@ function syncAudioForm() {
   el('audio-file-wrap').classList.toggle('hidden', action === 'remove');
   el('audio-vol-wrap').classList.toggle('hidden', action === 'remove');
   el('audio-orig-wrap').classList.toggle('hidden', action !== 'mix');
-  el('audio-output').placeholder = '(auto: name_'
-    + { remove: 'muted', replace: 'audio', mix: 'mixed' }[action] + '.mp4)';
+  setAudioOutputName();
+}
+
+// Default name: name_no_audio.ext, or name_new_audio.ext for replace / mix.
+function setAudioOutputName() {
+  if (!state.current || state.audioOutEdited) return;
+  const name = state.current.name;
+  const dot = name.lastIndexOf('.');
+  const stem = dot > 0 ? name.slice(0, dot) : name;
+  const ext = dot > 0 ? name.slice(dot) : '.mp4';
+  const action = el('audio-action').value;
+  el('audio-output').value = `${stem}_${action === 'remove' ? 'no_audio' : 'new_audio'}${ext}`;
 }
 
 function setAudioBusy(busy) {
@@ -1228,6 +1240,7 @@ el('transcribe').addEventListener('click', startTranscribe);
 el('export-subs').addEventListener('click', exportVideoWithCaptions);
 el('audio-action').addEventListener('change', syncAudioForm);
 el('audio-run').addEventListener('click', runAudio);
+el('audio-output').addEventListener('input', () => { state.audioOutEdited = true; });
 syncAudioForm();
 el('asr-engine').addEventListener('change', () => {
   const isGroq = el('asr-engine').value === 'groq';

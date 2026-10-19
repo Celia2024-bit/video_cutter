@@ -106,19 +106,19 @@ code is 1 if any job failed.
 ## Remove or change the sound
 
 ```bash
-# remove the sound         -> talk_muted.mp4
+# remove the sound         -> talk_no_audio.mp4
 python video_cutter.py talk.mp4 --mute
 
-# replace the sound        -> talk_audio.mp4
+# replace the sound        -> talk_new_audio.mp4
 python video_cutter.py talk.mp4 --audio music.mp3
 
-# keep the voice, add quiet music underneath   -> talk_mixed.mp4
+# keep the voice, add quiet music underneath   -> talk_new_audio.mp4
 python video_cutter.py talk.mp4 --audio music.mp3 --mix --volume 0.3
 ```
 
 The picture is copied, never re-encoded, so it is fast and lossless; the original file is
-not touched. Replacing or mixing encodes the sound as AAC (a container that cannot hold it
-is written as `.mp4`), and the result is cut to the video's length.
+not touched. The output keeps the original file format. Replacing or mixing encodes the sound as AAC
+(Opus for `.webm`), and the result is cut to the video's length.
 
 | flag                     | what it does                                                  |
 | ------------------------ | ------------------------------------------------------------- |

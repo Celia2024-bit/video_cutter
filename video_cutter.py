@@ -1043,11 +1043,8 @@ def edit_audio(source, output=None, action="remove", audio=None, volume=1.0,
     if volume < 0 or original_volume < 0:
         raise ValueError("volume cannot be negative")
 
-    suffix = source.suffix.lower() or ".mp4"
-    if action != "remove" and suffix not in REENCODE_CONTAINERS:
-        print(f"  note: {suffix} cannot hold AAC, writing .mp4 instead")
-        suffix = ".mp4"
-    tag = {"remove": "muted", "replace": "audio", "mix": "mixed"}[action]
+    suffix = source.suffix or ".mp4"
+    tag = {"remove": "no_audio", "replace": "new_audio", "mix": "new_audio"}[action]
     if output:
         target = Path(output)
         if target.is_dir():
@@ -1074,7 +1071,9 @@ def edit_audio(source, output=None, action="remove", audio=None, volume=1.0,
                      f"[0:a:0]volume={original_volume}[a0];[1:a:0]volume={volume}[a1];"
                      "[a0][a1]amix=inputs=2:duration=first:normalize=0[aout]",
                      "-map", "[aout]"]
-        args += ["-c:v", "copy", "-c:a", "aac", "-b:a", "192k", "-shortest", str(target)]
+        # Keep the original container; WebM is the one that cannot hold AAC.
+        codec = "libopus" if target.suffix.lower() == ".webm" else "aac"
+        args += ["-c:v", "copy", "-c:a", codec, "-b:a", "192k", "-shortest", str(target)]
     run_ffmpeg(args, verbose)
     print(f"  wrote {target}  ({target.stat().st_size / 1_048_576:.1f} MB)")
     return target
